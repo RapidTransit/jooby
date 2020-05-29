@@ -5,6 +5,8 @@
  */
 package io.jooby.gradle;
 
+import com.google.common.hash.HashFunction;
+import com.google.common.hash.Hashing;
 import io.jooby.run.JoobyRun;
 import io.jooby.run.JoobyRunOptions;
 import org.gradle.api.Project;
@@ -18,12 +20,16 @@ import org.gradle.tooling.ProjectConnection;
 import org.gradle.tooling.ResultHandler;
 
 import java.io.File;
+import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
+import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.List;
-import java.util.Optional;
-import java.util.Scanner;
-import java.util.Set;
+import java.util.*;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
 import java.util.function.BiConsumer;
 
 /**
@@ -50,6 +56,7 @@ public class RunTask extends BaseTask {
 
   private Integer port;
 
+
   /**
    * Run task.
    *
@@ -58,6 +65,8 @@ public class RunTask extends BaseTask {
   @TaskAction
   public void run() throws Throwable {
     try {
+      Map<Path, Long> hashPaths = new ConcurrentHashMap<>();
+      HashFunction hasher = Hashing.murmur3_32();
       Project current = getProject();
       String[] tasks = current.getGradle().getTaskGraph().getAllTasks().stream()
           .map(Task::getName)
@@ -93,7 +102,29 @@ public class RunTask extends BaseTask {
         connection.close();
       };
 
+      CompilationQueue compilationQueue = new CompilationQueue(joobyRun, tasks);
+
       Runtime.getRuntime().addShutdownHook(new Thread(shutdown));
+
+      BiConsumer<String, Path> onGeneratedChanged = (event, path) -> {
+        if (config.isCompileExtension(path)) {
+          if (Files.isRegularFile(path)) {
+            try {
+              byte[] bytes = Files.readAllBytes(path);
+              Long hashCode = hasher.hashBytes(bytes).asLong();
+              Long previousHash = hashPaths.putIfAbsent(path, hashCode);
+              if (!Objects.equals(hashCode, previousHash)) {
+
+                compilationQueue.queue
+                    .offer(new CompilationQueueItem(path, System.currentTimeMillis()),
+                        1,  TimeUnit.MILLISECONDS);
+              }
+            } catch (Throwable t){
+              t.printStackTrace();
+            }
+          }
+        }
+      };
 
       BiConsumer<String, Path> onFileChanged = (event, path) -> {
         if (config.isCompileExtension(path)) {
@@ -155,6 +186,26 @@ public class RunTask extends BaseTask {
       throw x.getCause();
     }
   }
+
+
+  protected void runCompiler(JoobyRun joobyRun, String[] tasks, Path path){
+    BuildLauncher compiler = connection.newBuild()
+        .setStandardError(System.err)
+        .setStandardOutput(System.out)
+        .forTasks(tasks);
+
+    compiler.run(new ResultHandler<Void>() {
+      @Override public void onComplete(Void result) {
+        getLogger().debug("Restarting application on file change: " + path);
+        joobyRun.restart();
+      }
+
+      @Override public void onFailure(GradleConnectionException failure) {
+        getLogger().debug("Compilation error found: " + path);
+      }
+    });
+  }
+
 
   /**
    * Main class to run.
@@ -248,5 +299,79 @@ public class RunTask extends BaseTask {
         }
       }
     }, "jooby-shutdown").start();
+  }
+
+  private class CompilationQueue implements Runnable {
+
+    private final BlockingQueue<CompilationQueueItem> queue = new ArrayBlockingQueue<>(1000);
+
+    private final JoobyRun joobyRun;
+    private final String[] tasks;
+
+
+    public CompilationQueue(JoobyRun joobyRun, String[] tasks) {
+      this.joobyRun = joobyRun;
+      this.tasks = tasks;
+    }
+
+    @Override
+    public void run() {
+      for(;;){
+        try {
+          CompilationQueueItem queueItem = queue.take();
+          LockSupport.parkNanos(1_000); // Prevent the queue from a potential flood
+          int count = 0;
+          while ((queue.poll() != null && count < 1_000) || count > 1_000){
+            count++;
+          }
+          Path path = queueItem.path;
+          BuildLauncher compiler = connection.newBuild()
+              .setStandardError(System.err)
+              .setStandardOutput(System.out)
+              .forTasks(tasks);
+
+          compiler.run(new ResultHandler<Void>() {
+            @Override public void onComplete(Void result) {
+              getLogger().debug("Restarting application on file change: " + path);
+              joobyRun.restart();
+            }
+
+            @Override public void onFailure(GradleConnectionException failure) {
+              getLogger().debug("Compilation error found: " + path);
+            }
+          });
+        } catch (Throwable t) {
+          t.printStackTrace();
+        }
+      }
+    }
+  }
+
+  private static class CompilationQueueItem {
+    private final Path path;
+    private final long stamp;
+
+    public CompilationQueueItem(Path path, long stamp) {
+      this.path = path;
+      this.stamp = stamp;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (o == null || getClass() != o.getClass()) return false;
+
+      CompilationQueueItem that = (CompilationQueueItem) o;
+
+      if (stamp != that.stamp) return false;
+      return path != null ? path.equals(that.path) : that.path == null;
+    }
+
+    @Override
+    public int hashCode() {
+      int result = path != null ? path.hashCode() : 0;
+      result = 31 * result + (int) (stamp ^ (stamp >>> 32));
+      return result;
+    }
   }
 }
